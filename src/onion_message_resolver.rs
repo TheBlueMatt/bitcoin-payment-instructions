@@ -85,6 +85,10 @@ fn channel() -> (ChannelSend, ChannelRecv) {
 /// This implements LDK's [`DNSResolverMessageHandler`], which it uses to send onion messages and
 /// process response messages.
 ///
+/// Note that because this implementation does not assume an async runtime, queries which are not
+/// responded to *may hang forever*. You must always wrap resolution futures to ensure they time
+/// out properly, eg via `tokio::time::timeout`.
+///
 /// Note that after a query begines, [`PeerManager::process_events`] should be called to ensure the
 /// query message goes out in a timely manner. You can call [`Self::register_post_queue_action`] to
 /// have this happen automatically.
