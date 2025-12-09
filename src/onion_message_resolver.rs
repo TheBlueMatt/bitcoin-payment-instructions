@@ -323,7 +323,7 @@ mod tests {
 	async fn test_dns_om_hrn_resolver() {
 		let graph = Arc::new(NetworkGraph::new(Network::Bitcoin, &TestLogger));
 		let resolver = Arc::new(LDKOnionMessageDNSSECHrnResolver::new(Arc::clone(&graph)));
-		let signer = Arc::new(KeysManager::new(&OsRng.get_secure_random_bytes(), 0, 0));
+		let signer = Arc::new(KeysManager::new(&OsRng.get_secure_random_bytes(), 0, 0, true));
 		let message_router = Arc::new(DefaultMessageRouter::new(Arc::clone(&graph), &OsRng));
 		let messenger = Arc::new(OnionMessenger::new(
 			&OsRng,
@@ -342,6 +342,7 @@ mod tests {
 			route_handler: Arc::new(P2PGossipSync::new(Arc::clone(&graph), no_utxos, &TestLogger)),
 			onion_message_handler: Arc::clone(&messenger),
 			custom_message_handler: &IgnoringMessageHandler {},
+			send_only_message_handler: &IgnoringMessageHandler {},
 		};
 		let rand = OsRng.get_secure_random_bytes();
 		let peer_manager =
