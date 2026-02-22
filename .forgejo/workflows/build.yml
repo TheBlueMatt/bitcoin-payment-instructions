@@ -1,0 +1,96 @@
+name: Continuous Integration Checks
+
+on:
+  push:
+    branches-ignore:
+      - master
+  pull_request:
+    branches-ignore:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ debian-trixie ]
+        toolchain: [ stable, beta, 1.63.0 ] # 1.63.0 is the MSRV
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.toolchain }} toolchain
+        run: |
+          rustup toolchain install ${{ matrix.toolchain }}
+          rustup override set ${{ matrix.toolchain }}
+      - name: shellcheck the CI and `contrib` scripts
+        run: |
+          shellcheck ci/*.sh -aP ci
+      - name: Set RUSTFLAGS to deny warnings
+        if: "matrix.toolchain == '1.63.0'"
+        run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
+      - name: Run CI script
+        shell: bash # Default on Winblows is powershell
+        run: ./ci/ci-tests.sh
+
+  linting:
+    runs-on: debian-trixie
+    env:
+      TOOLCHAIN: 1.63.0
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
+      - name: Install clippy
+        run: |
+          rustup component add clippy
+      - name: Run default clippy linting
+        run: |
+          ./ci/check-lint.sh
+
+  rustfmt:
+    runs-on: debian-trixie
+    env:
+      TOOLCHAIN: 1.63.0
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
+      - name: Install rustfmt
+        run: |
+          rustup component add rustfmt
+      - name: Run rustfmt checks
+        run: ci/rustfmt.sh
+
+  fuzz:
+    runs-on: debian-trixie
+    env:
+      TOOLCHAIN: 1.63
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+      - name: Install Rust ${{ env.TOOLCHAIN }} toolchain
+        run: |
+          rustup toolchain install ${{ env.TOOLCHAIN }}
+          rustup override set ${{ env.TOOLCHAIN }}
+      - name: Sanity check fuzz targets on Rust ${{ env.TOOLCHAIN }}
+        run: |
+          cd fuzz
+          cargo update -p syn --precise "2.0.106" --verbose
+          cargo update -p quote --precise "1.0.41" --verbose
+          cargo update -p proc-macro2 --precise "1.0.103" --verbose
+          cargo update -p unicode-ident --precise "1.0.22" --verbose
+          RUSTFLAGS="--cfg=fuzzing --cfg=secp256k1_fuzz --cfg=hashes_fuzz" cargo test --verbose --color always
+          cargo clean
+      - name: Run fuzzers
+        run: cd fuzz && ./ci-fuzz.sh && cd ..
