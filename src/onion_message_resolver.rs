@@ -421,6 +421,7 @@ mod tests {
 				},
 				PaymentMethod::LightningBolt12(_) => {},
 				PaymentMethod::OnChain { .. } => {},
+				PaymentMethod::Bark(_) => {},
 				PaymentMethod::Cashu(_) => {},
 			}
 		}

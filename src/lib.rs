@@ -64,6 +64,8 @@ pub mod amount;
 
 pub mod receive;
 
+pub mod ark;
+
 pub mod cashu;
 
 pub mod hrn_resolution;
@@ -80,6 +82,8 @@ pub enum PaymentMethod {
 	LightningBolt12(Offer),
 	/// A payment directly on-chain to the specified address.
 	OnChain(Address),
+	/// A payment using Bark as described by the given Bark address.
+	Bark(ark::BarkAddress),
 	/// A payment using Cashu as described by the given NUT-26 payment request.
 	Cashu(cashu::CashuPaymentRequest),
 }
@@ -103,7 +107,7 @@ impl PaymentMethod {
 				Some(offer::Amount::Currency { .. }) => None,
 				None => None,
 			},
-			PaymentMethod::OnChain(_) => None,
+			PaymentMethod::OnChain(_) | PaymentMethod::Bark(_) => None,
 			PaymentMethod::Cashu(req) => match req.unit {
 				Some(cashu::CurrencyUnit::Sat) => {
 					req.amount.and_then(|a| Amount::from_sats(a).ok())
@@ -121,7 +125,18 @@ impl PaymentMethod {
 			PaymentMethod::LightningBolt11(_) => true,
 			PaymentMethod::LightningBolt12(_) => true,
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::Bark(_) => false,
 			PaymentMethod::Cashu(_) => false,
+		}
+	}
+
+	fn is_ark(&self) -> bool {
+		match self {
+			PaymentMethod::Bark(_) => true,
+			PaymentMethod::LightningBolt11(_)
+			| PaymentMethod::LightningBolt12(_)
+			| PaymentMethod::OnChain(_)
+			| PaymentMethod::Cashu(_) => false,
 		}
 	}
 
@@ -134,6 +149,7 @@ impl PaymentMethod {
 				None => false,
 			},
 			PaymentMethod::OnChain(_) => false,
+			PaymentMethod::Bark(_) => false,
 			PaymentMethod::Cashu(req) => req.amount.is_some(),
 		}
 	}
@@ -171,6 +187,8 @@ pub enum PaymentMethodType {
 	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
 	/// [`PaymentMethod::OnChain`].
 	OnChain,
+	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a [`PaymentMethod::Bark`].
+	Bark,
 	/// The [`PossiblyResolvedPaymentMethod`] will eventually resolve to a
 	/// [`PaymentMethod::Cashu`].
 	Cashu,
@@ -184,6 +202,7 @@ impl<'a> PossiblyResolvedPaymentMethod<'a> {
 			Self::Resolved(PaymentMethod::LightningBolt11(_)) => PaymentMethodType::LightningBolt11,
 			Self::Resolved(PaymentMethod::LightningBolt12(_)) => PaymentMethodType::LightningBolt12,
 			Self::Resolved(PaymentMethod::OnChain(_)) => PaymentMethodType::OnChain,
+			Self::Resolved(PaymentMethod::Bark(_)) => PaymentMethodType::Bark,
 			Self::Resolved(PaymentMethod::Cashu(_)) => PaymentMethodType::Cashu,
 		}
 	}
@@ -196,6 +215,7 @@ struct PaymentInstructionsImpl {
 	ln_amt: Option<Amount>,
 	cashu_amt: Option<Amount>,
 	onchain_amt: Option<Amount>,
+	ark_amt: Option<Amount>,
 	lnurl: Option<(String, [u8; 32], Amount, Amount)>,
 	pop_callback: Option<String>,
 	hrn: Option<HumanReadableName>,
@@ -221,8 +241,8 @@ macro_rules! common_methods {
 			///
 			/// Once a payment has been completed, the proof-of-payment (hex-encoded payment preimage for a
 			/// lightning BOLT 11 invoice, raw transaction serialized in hex for on-chain payments,
-			/// not-yet-defined for lightning BOLT 12 invoices) must be appended to this URI and the URI
-			/// opened with the default system URI handler.
+			/// not-yet-defined for lightning BOLT 12 invoices and Bark payments) must be appended to this
+			/// URI and the URI opened with the default system URI handler.
 			#[inline]
 			pub fn pop_callback(&self) -> Option<&str> {
 				self.inner().pop_callback.as_ref().map(|c| c.as_str())
@@ -268,7 +288,7 @@ impl FixedAmountPaymentInstructions {
 	/// if a recipient wishes to be paid more for on-chain payments to offset their future fees),
 	/// but only up to [`MAX_AMOUNT_DIFFERENCE`].
 	pub fn max_amount(&self) -> Option<Amount> {
-		[self.inner.ln_amt, self.inner.onchain_amt, self.inner.cashu_amt]
+		[self.inner.ln_amt, self.inner.onchain_amt, self.inner.ark_amt, self.inner.cashu_amt]
 			.into_iter()
 			.flatten()
 			.max()
@@ -308,6 +328,16 @@ impl FixedAmountPaymentInstructions {
 	/// currently, and as such all on-chain [`PaymentMethod`]s are for the same amount.
 	pub fn onchain_payment_amount(&self) -> Option<Amount> {
 		self.inner.onchain_amt
+	}
+
+	/// The amount which the payment instruction requires when paid via Ark.
+	///
+	/// Will return `None` if no Ark payment instructions are available.
+	///
+	/// We require that all Ark payment methods in payment instructions require an identical amount
+	/// for payment.
+	pub fn ark_payment_amount(&self) -> Option<Amount> {
+		self.inner.ark_amt
 	}
 
 	/// The list of [`PaymentMethod`]s.
@@ -376,6 +406,7 @@ impl ConfigurableAmountPaymentInstructions {
 			}
 			debug_assert!(inner.methods.is_empty());
 			debug_assert!(inner.onchain_amt.is_none());
+			debug_assert!(inner.ark_amt.is_none());
 			debug_assert!(inner.cashu_amt.is_none());
 			debug_assert!(inner.pop_callback.is_none());
 			debug_assert!(inner.hrn_proof.is_none());
@@ -391,6 +422,11 @@ impl ConfigurableAmountPaymentInstructions {
 				let amt = Amount::from_sats((amount.milli_sats() + 999) / 1000)
 					.map_err(|_| "Requested amount was too close to 21M sats to round up")?;
 				inner.onchain_amt = Some(amt);
+			}
+			if inner.methods.iter().any(|meth| meth.is_ark()) {
+				let amt = Amount::from_sats((amount.milli_sats() + 999) / 1000)
+					.map_err(|_| "Requested amount was too close to 21M sats to round up")?;
+				inner.ark_amt = Some(amt);
 			}
 			if inner.methods.iter().any(|meth| meth.is_lightning()) {
 				inner.ln_amt = Some(amount);
@@ -417,6 +453,7 @@ common_methods!(ConfigurableAmountPaymentInstructions);
 ///  * Lightning BOLT 11 invoices (optionally with the lightning: URI prefix)
 ///  * Lightning BOLT 12 offers
 ///  * On-chain addresses
+///  * Bark addresses
 ///  * BIP 353 human-readable names in the name@domain format.
 ///  * LN-Address human-readable names in the name@domain format.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -431,7 +468,9 @@ pub enum PaymentInstructions {
 	ConfigurableAmount(ConfigurableAmountPaymentInstructions),
 	/// The payment instructions support only payment for specific amount(s) given by
 	/// [`FixedAmountPaymentInstructions::ln_payment_amount`] and
-	/// [`FixedAmountPaymentInstructions::onchain_payment_amount`] (which are within
+	/// [`FixedAmountPaymentInstructions::onchain_payment_amount`],
+	/// [`FixedAmountPaymentInstructions::ark_payment_amount`], and
+	/// [`FixedAmountPaymentInstructions::cashu_payment_amount`] (which are within
 	/// [`MAX_AMOUNT_DIFFERENCE`] of each other).
 	FixedAmount(FixedAmountPaymentInstructions),
 }
@@ -464,6 +503,8 @@ pub enum ParseError {
 	InvalidBolt12(Bolt12ParseError),
 	/// An invalid on-chain address was encountered
 	InvalidOnChain(address::ParseError),
+	/// An invalid Bark address was encountered
+	InvalidArk(ark::ParseAddressError),
 	/// An invalid Cashu payment request was encountered
 	InvalidCashu(cashu::Error),
 	/// An invalid lnurl was encountered
@@ -619,6 +660,7 @@ fn parse_resolved_instructions(
 		}
 		if let Some(params) = params {
 			let mut onchain_amt = None;
+			let mut ark_amt = None;
 			for param in params.split('&') {
 				let (k, v) = split_once(param, '=');
 
@@ -647,6 +689,35 @@ fn parse_resolved_instructions(
 					parse_segwit("bc1")?;
 				} else if k.eq_ignore_ascii_case("tb") || k.eq_ignore_ascii_case("req-tb") {
 					parse_segwit("tb1")?;
+				} else if k.eq_ignore_ascii_case("ark")
+					|| k.eq_ignore_ascii_case("req-ark")
+					|| k.eq_ignore_ascii_case("tark")
+					|| k.eq_ignore_ascii_case("req-tark")
+				{
+					if let Some(address_string) = v {
+						let expected_hrp =
+							if k.eq_ignore_ascii_case("ark") || k.eq_ignore_ascii_case("req-ark") {
+								"ark1"
+							} else {
+								"tark1"
+							};
+						if address_string.is_char_boundary(expected_hrp.len())
+							&& !address_string[..expected_hrp.len()]
+								.eq_ignore_ascii_case(expected_hrp)
+						{
+							let err = "BIP 321 bitcoin: URI contained an ark/tark instruction which did not match its Bark address HRP";
+							return Err(ParseError::InvalidInstructions(err));
+						}
+						let addr = ark::BarkAddress::from_str(address_string)
+							.map_err(ParseError::InvalidArk)?;
+						let address =
+							addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
+						methods.push(PaymentMethod::Bark(address));
+					} else {
+						let err =
+							"BIP 321 bitcoin: URI contained an ark/tark instruction without a value";
+						return Err(ParseError::InvalidInstructions(err));
+					}
 				} else if k.eq_ignore_ascii_case("lightning")
 					|| k.eq_ignore_ascii_case("req-lightning")
 				{
@@ -767,6 +838,7 @@ fn parse_resolved_instructions(
 							return Err(ParseError::InconsistentInstructions(err));
 						}
 						onchain_amt = Some(amount);
+						ark_amt = Some(amount);
 					} else {
 						let err = "Missing value for an amount parameter in a BIP 321 bitcoin: URI";
 						return Err(ParseError::InvalidInstructions(err));
@@ -803,6 +875,7 @@ fn parse_resolved_instructions(
 					| PaymentMethod::LightningBolt12(_)
 					| PaymentMethod::Cashu(_) => method.amount(),
 					PaymentMethod::OnChain(_) => onchain_amt,
+					PaymentMethod::Bark(_) => ark_amt,
 				};
 				if let Some(amt) = amt {
 					if amt < min_amt {
@@ -830,7 +903,7 @@ fn parse_resolved_instructions(
 							}
 							cashu_amt = Some(amt);
 						},
-						PaymentMethod::OnChain(_) => {},
+						PaymentMethod::OnChain(_) | PaymentMethod::Bark(_) => {},
 					}
 				} else if method.has_fixed_amount() {
 					have_non_btc_denominated_method = true;
@@ -856,6 +929,7 @@ fn parse_resolved_instructions(
 				description,
 				methods,
 				onchain_amt,
+				ark_amt,
 				ln_amt,
 				cashu_amt,
 				lnurl: None,
@@ -879,6 +953,7 @@ fn parse_resolved_instructions(
 					description,
 					methods,
 					onchain_amt: None,
+					ark_amt: None,
 					ln_amt: None,
 					cashu_amt: None,
 					lnurl: None,
@@ -901,6 +976,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: method_iter.collect(),
 			onchain_amt: amounts.fallbacks_amount,
+			ark_amt: None,
 			ln_amt: amounts.ln_amount,
 			cashu_amt: None,
 			lnurl: None,
@@ -922,6 +998,23 @@ fn parse_resolved_instructions(
 				description: None,
 				methods: vec![PaymentMethod::OnChain(address)],
 				onchain_amt: None,
+				ark_amt: None,
+				ln_amt: None,
+				cashu_amt: None,
+				lnurl: None,
+				pop_callback: None,
+				hrn,
+				hrn_proof,
+			},
+		}))
+	} else if let Ok(addr) = ark::BarkAddress::from_str(instructions) {
+		let address = addr.require_network(network).map_err(|_| ParseError::WrongNetwork)?;
+		Ok(PaymentInstructions::ConfigurableAmount(ConfigurableAmountPaymentInstructions {
+			inner: PaymentInstructionsImpl {
+				description: None,
+				methods: vec![PaymentMethod::Bark(address)],
+				onchain_amt: None,
+				ark_amt: None,
 				ln_amt: None,
 				cashu_amt: None,
 				lnurl: None,
@@ -936,6 +1029,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: method_iter.collect(),
 			onchain_amt: amounts.fallbacks_amount,
+			ark_amt: None,
 			ln_amt: amounts.ln_amount,
 			cashu_amt: None,
 			lnurl: None,
@@ -972,6 +1066,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: vec![PaymentMethod::Cashu(creq)],
 			onchain_amt: None,
+			ark_amt: None,
 			ln_amt: None,
 			cashu_amt,
 			lnurl: None,
@@ -994,6 +1089,7 @@ fn parse_resolved_instructions(
 			description,
 			methods: vec![method],
 			onchain_amt: None,
+			ark_amt: None,
 			cashu_amt: None,
 			lnurl: None,
 			pop_callback: None,
@@ -1040,6 +1136,7 @@ impl PaymentInstructions {
 						methods: Vec::new(),
 						lnurl: Some((callback, expected_description_hash, min_value, max_value)),
 						onchain_amt: None,
+						ark_amt: None,
 						ln_amt: None,
 						cashu_amt: None,
 						pop_callback: None,
@@ -1091,6 +1188,7 @@ impl PaymentInstructions {
 								max_value,
 							)),
 							onchain_amt: None,
+							ark_amt: None,
 							ln_amt: None,
 							cashu_amt: None,
 							pop_callback: None,
@@ -1226,6 +1324,53 @@ mod tests {
 		} else {
 			panic!("Wrong method");
 		}
+	}
+
+	#[tokio::test]
+	async fn parse_bark_address() {
+		let addr_str = "ark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mqkr4cf5";
+		let parsed =
+			PaymentInstructions::parse(addr_str, Network::Bitcoin, &DummyHrnResolver, false)
+				.await
+				.unwrap();
+
+		let resolved = match parsed {
+			PaymentInstructions::ConfigurableAmount(parsed) => {
+				assert_eq!(parsed.methods().count(), 1);
+				parsed.set_amount(Amount::from_sats(10).unwrap(), &DummyHrnResolver).await.unwrap()
+			},
+			_ => panic!(),
+		};
+
+		assert_eq!(resolved.ark_payment_amount(), Some(Amount::from_sats(10).unwrap()));
+		if let PaymentMethod::Bark(address) = &resolved.methods()[0] {
+			assert_eq!(address.to_string(), addr_str);
+		} else {
+			panic!("Wrong method");
+		}
+	}
+
+	#[tokio::test]
+	async fn parse_testnet_bark_address() {
+		let addr_str = "tark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mq47jn9z";
+		let parsed =
+			PaymentInstructions::parse(addr_str, Network::Signet, &DummyHrnResolver, false)
+				.await
+				.unwrap();
+
+		assert!(matches!(parsed, PaymentInstructions::ConfigurableAmount(_)));
+		if let PaymentInstructions::ConfigurableAmount(parsed) = parsed {
+			if !matches!(
+				parsed.methods().next().unwrap(),
+				PossiblyResolvedPaymentMethod::Resolved(PaymentMethod::Bark(_))
+			) {
+				panic!("Wrong method");
+			}
+		}
+		assert!(matches!(
+			PaymentInstructions::parse(addr_str, Network::Bitcoin, &DummyHrnResolver, false).await,
+			Err(ParseError::WrongNetwork)
+		));
 	}
 
 	// Test a handful of ways a lightning invoice might be communicated
@@ -1404,6 +1549,113 @@ mod tests {
 		assert_eq!(parsed.onchain_payment_amount(), Some(expected_amount));
 		assert_eq!(parsed.recipient_description(), None);
 		assert!(matches!(parsed.methods()[0], PaymentMethod::OnChain(_)));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_bark() {
+		let addr_str = "ark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mqkr4cf5";
+		let uri = format!("bitcoin:?amount=0.00001&ark={}", addr_str);
+		let parsed = PaymentInstructions::parse(&uri, Network::Bitcoin, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+		let uppercase_parsed = PaymentInstructions::parse(
+			&uri.to_ascii_uppercase(),
+			Network::Bitcoin,
+			&DummyHrnResolver,
+			false,
+		)
+		.await
+		.unwrap();
+		assert_eq!(uppercase_parsed, parsed);
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount"),
+		};
+
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.ark_payment_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.methods().len(), 1);
+		assert!(matches!(parsed.methods()[0], PaymentMethod::Bark(_)));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_tark() {
+		let addr_str = "tark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mq47jn9z";
+		let uri = format!("bitcoin:?amount=0.00001&tark={}", addr_str);
+		let parsed = PaymentInstructions::parse(&uri, Network::Signet, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount"),
+		};
+
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.ark_payment_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.methods().len(), 1);
+		assert!(matches!(parsed.methods()[0], PaymentMethod::Bark(_)));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_multiple_bark_addresses() {
+		let addr_str = "ark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mqkr4cf5";
+		let uri = format!("bitcoin:?amount=0.00001&ark={}&req-ark={}", addr_str, addr_str);
+		let parsed = PaymentInstructions::parse(&uri, Network::Bitcoin, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount"),
+		};
+
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.ark_payment_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.methods().len(), 2);
+		assert!(parsed.methods().iter().all(|method| matches!(method, PaymentMethod::Bark(_))));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_multiple_testnet_bark_addresses() {
+		let addr_str = "tark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mq47jn9z";
+		let uri = format!("bitcoin:?amount=0.00001&tark={}&req-tark={}", addr_str, addr_str);
+		let parsed = PaymentInstructions::parse(&uri, Network::Signet, &DummyHrnResolver, false)
+			.await
+			.unwrap();
+
+		let parsed = match parsed {
+			PaymentInstructions::FixedAmount(parsed) => parsed,
+			_ => panic!("Expected FixedAmount"),
+		};
+
+		assert_eq!(parsed.max_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.ark_payment_amount(), Some(Amount::from_sats(1000).unwrap()));
+		assert_eq!(parsed.methods().len(), 2);
+		assert!(parsed.methods().iter().all(|method| matches!(method, PaymentMethod::Bark(_))));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_with_wrong_network_tark() {
+		let addr_str = "tark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mq47jn9z";
+		let uri = format!("bitcoin:?tark={}", addr_str);
+
+		assert!(matches!(
+			PaymentInstructions::parse(&uri, Network::Bitcoin, &DummyHrnResolver, false).await,
+			Err(ParseError::WrongNetwork)
+		));
+	}
+
+	#[tokio::test]
+	async fn parse_bip_21_rejects_mismatched_bark_hrp() {
+		let addr_str = "tark1pwh9vsmezqqpharv69q4z8m6x364d5m5prnmcalcalq9pdmzw0y7mpveck4pcfhezqypczkrrj3lkx5ue4qrf4jc7ztpt9htdttmh2judhqnu7aue8p0y9mq47jn9z";
+		let uri = format!("bitcoin:?ark={}", addr_str);
+
+		assert!(matches!(
+			PaymentInstructions::parse(&uri, Network::Signet, &DummyHrnResolver, false).await,
+			Err(ParseError::InvalidInstructions(_))
+		));
 	}
 
 	#[cfg(not(feature = "std"))]
