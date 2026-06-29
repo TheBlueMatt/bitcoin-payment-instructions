@@ -6,6 +6,12 @@ RUSTC_MINOR_VERSION=$(rustc --version | awk '{ split($2,a,"."); print a[2] }')
 # Starting with version 1.39.0, the `tokio` crate has an MSRV of rustc 1.70.0
 [ "$RUSTC_MINOR_VERSION" -lt 70 ] && cargo update -p tokio --precise "1.38.1" --verbose
 
+# unicode-ident 1.0.23 requires rustc 1.71.0
+cargo update -p unicode-ident --precise "1.0.22" --verbose
+
+# libc 0.2.184 requires rustc 1.65.0
+cargo update -p libc --precise "0.2.183" --verbose
+
 # syn 2.0.107 requires rustc 1.68.0
 [ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p syn --precise "2.0.106" --verbose
 # quote 1.0.42 requires rustc 1.68.0
