@@ -388,7 +388,7 @@ impl ConfigurableAmountPaymentInstructions {
 			inner.ln_amt = Some(amount);
 		} else {
 			if inner.methods.iter().any(|meth| matches!(meth, PaymentMethod::OnChain(_))) {
-				let amt = Amount::from_milli_sats((amount.milli_sats() + 999) / 1000)
+				let amt = Amount::from_sats((amount.milli_sats() + 999) / 1000)
 					.map_err(|_| "Requested amount was too close to 21M sats to round up")?;
 				inner.onchain_amt = Some(amt);
 			}
@@ -1207,17 +1207,20 @@ mod tests {
 
 		assert_eq!(parsed.recipient_description(), None);
 
+		let amount = Amount::from_sats(10_000).unwrap();
+
 		let resolved = match parsed {
 			PaymentInstructions::ConfigurableAmount(parsed) => {
 				assert_eq!(parsed.min_amt(), None);
 				assert_eq!(parsed.min_amt(), None);
 				assert_eq!(parsed.methods().collect::<Vec<_>>().len(), 1);
-				parsed.set_amount(Amount::from_sats(10).unwrap(), &DummyHrnResolver).await.unwrap()
+				parsed.set_amount(amount, &DummyHrnResolver).await.unwrap()
 			},
 			_ => panic!(),
 		};
 
 		assert_eq!(resolved.methods().len(), 1);
+		assert_eq!(resolved.onchain_payment_amount(), Some(amount));
 		if let PaymentMethod::OnChain(address) = &resolved.methods()[0] {
 			assert_eq!(*address, Address::from_str(addr_str).unwrap().assume_checked());
 		} else {
