@@ -33,3 +33,9 @@ serde_json = { version = "1.0", default-features = false, optional = true, featu
 tokio = { version = "1.0", default-features = false, features = ["rt", "macros"] }
 lightning = { version = "0.2.0", features = ["std"] }
 lightning-net-tokio = { version = "0.2.0", default-features = false }
+
+[lints.rust.unexpected_cfgs]
+level = "forbid"
+check-cfg = [
+    "cfg(fuzzing)",
+]

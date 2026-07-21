@@ -13,6 +13,8 @@ cargo update -p unicode-ident --precise "1.0.22" --verbose
 # libc 0.2.184 requires rustc 1.65.0
 cargo update -p libc --precise "0.2.183" --verbose
 
+# serde* 1.0.229 requires rustc 1.71
+[ "$RUSTC_MINOR_VERSION" -lt 71 ] && cargo update -p serde --precise "1.0.228" --verbose
 # syn 2.0.107 requires rustc 1.68.0
 [ "$RUSTC_MINOR_VERSION" -lt 68 ] && cargo update -p syn --precise "2.0.106" --verbose
 # quote 1.0.42 requires rustc 1.68.0
