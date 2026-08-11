@@ -3,7 +3,7 @@ name = "bitcoin-payment-instructions"
 version = "0.7.0"
 authors = ["Matt Corallo", "Ben Carman"]
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/rust-bitcoin/bitcoin-payment-instructions"
+repository = "https://git.rust-bitcoin.org/rust-bitcoin/bitcoin-payment-instructions"
 description = """
 A parser for arbitrary bitcoin payment instructions.
 """
