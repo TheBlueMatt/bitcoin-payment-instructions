@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll, Waker};
 use std::vec::Vec;
 
+use bitcoin::secp256k1::PublicKey;
 use lightning::blinded_path::message::{DNSResolverContext, MessageContext};
 use lightning::ln::channelmanager::PaymentId;
 use lightning::onion_message::dns_resolution::{
@@ -99,6 +100,7 @@ where
 	L::Target: Logger,
 {
 	network_graph: N,
+	resolver_nodes: Vec<PublicKey>,
 	resolver: OMNameResolver,
 	next_id: AtomicUsize,
 	pending_resolutions: Mutex<HashMap<HumanReadableName, Vec<(PaymentId, ChannelSend)>>>,
@@ -112,10 +114,15 @@ where
 {
 	/// Constructs a new [`LDKOnionMessageDNSSECHrnResolver`].
 	///
+	/// If `resolver_nodes` is non-empty, all DNS resolution queries are sent to the given
+	/// nodes, otherwise nodes which advertise support for DNS resolution in the network graph
+	/// are queried.
+	///
 	/// See the struct-level documentation for more info.
-	pub fn new(network_graph: N) -> Self {
+	pub fn new(network_graph: N, resolver_nodes: Vec<PublicKey>) -> Self {
 		Self {
 			network_graph,
+			resolver_nodes,
 			next_id: AtomicUsize::new(0),
 			// TODO: Swap for `new_without_expiry_validation` when we upgrade to LDK 0.2
 			resolver: OMNameResolver::new(0, 0),
@@ -147,31 +154,36 @@ where
 			self.resolver.new_best_block((now.as_secs() / 60) as u32, now.as_secs() as u32);
 		}
 
-		let mut dns_resolvers = Vec::new();
-		for (node_id, node) in self.network_graph.read_only().nodes().unordered_iter() {
-			if let Some(info) = &node.announcement_info {
-				// Sadly, 31 nodes currently squat on the DNS Resolver feature bit
-				// without speaking it.
-				// Its unclear why they're doing so, but none of them currently
-				// also have the onion messaging feature bit set, so here we check
-				// for both.
-				let supports_dns = info.features().supports_dns_resolution();
-				let supports_om = info.features().supports_onion_messages();
-				if supports_dns && supports_om {
-					if let Ok(pubkey) = node_id.as_pubkey() {
-						dns_resolvers.push(Destination::Node(pubkey));
+		let dns_resolvers = if !self.resolver_nodes.is_empty() {
+			self.resolver_nodes.iter().map(|node| Destination::Node(*node)).collect()
+		} else {
+			let mut dns_resolvers = Vec::new();
+			for (node_id, node) in self.network_graph.read_only().nodes().unordered_iter() {
+				if let Some(info) = &node.announcement_info {
+					// Sadly, 31 nodes currently squat on the DNS Resolver feature bit
+					// without speaking it.
+					// Its unclear why they're doing so, but none of them currently
+					// also have the onion messaging feature bit set, so here we check
+					// for both.
+					let supports_dns = info.features().supports_dns_resolution();
+					let supports_om = info.features().supports_onion_messages();
+					if supports_dns && supports_om {
+						if let Ok(pubkey) = node_id.as_pubkey() {
+							dns_resolvers.push(Destination::Node(pubkey));
+						}
 					}
 				}
+				if dns_resolvers.len() > 5 {
+					break;
+				}
 			}
-			if dns_resolvers.len() > 5 {
-				break;
+			if dns_resolvers.is_empty() {
+				return Err(
+					"Failed to find any DNS resolving nodes, check your network graph is synced",
+				);
 			}
-		}
-		if dns_resolvers.is_empty() {
-			return Err(
-				"Failed to find any DNS resolving nodes, check your network graph is synced",
-			);
-		}
+			dns_resolvers
+		};
 
 		let counter = self.next_id.fetch_add(1, Ordering::Relaxed) as u64;
 		let mut payment_id = [0; 32];
@@ -295,12 +307,15 @@ mod tests {
 	use bitcoin::hex::FromHex;
 	use bitcoin::secp256k1::PublicKey;
 
+	use std::sync::atomic::AtomicBool;
+
 	use lightning::blinded_path::NodeIdLookUp;
+	use lightning::events::{Event, EventsProvider};
 	use lightning::ln::peer_handler::{
 		ErroringMessageHandler, IgnoringMessageHandler, MessageHandler, PeerManager,
 	};
 	use lightning::onion_message::messenger::{DefaultMessageRouter, OnionMessenger};
-	use lightning::routing::gossip::{NodeId, P2PGossipSync};
+	use lightning::routing::gossip::P2PGossipSync;
 	use lightning::routing::utxo::UtxoLookup;
 	use lightning::sign::KeysManager;
 	use lightning::util::logger::Record;
@@ -321,109 +336,196 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_dns_om_hrn_resolver() {
-		let graph = Arc::new(NetworkGraph::new(Network::Bitcoin, &TestLogger));
-		let resolver = Arc::new(LDKOnionMessageDNSSECHrnResolver::new(Arc::clone(&graph)));
-		let signer = Arc::new(KeysManager::new(&OsRng.get_secure_random_bytes(), 0, 0, true));
-		let message_router = Arc::new(DefaultMessageRouter::new(Arc::clone(&graph), &OsRng));
-		let messenger = Arc::new(OnionMessenger::new(
-			&OsRng,
-			Arc::clone(&signer),
-			&TestLogger,
-			&NoPeers,
-			message_router,
-			&IgnoringMessageHandler {},
-			&IgnoringMessageHandler {},
-			Arc::clone(&resolver),
-			&IgnoringMessageHandler {},
-		));
-		let no_utxos = None::<&(dyn UtxoLookup + Sync + Send)>;
-		let handlers = MessageHandler {
-			chan_handler: Arc::new(ErroringMessageHandler::new()),
-			route_handler: Arc::new(P2PGossipSync::new(Arc::clone(&graph), no_utxos, &TestLogger)),
-			onion_message_handler: Arc::clone(&messenger),
-			custom_message_handler: &IgnoringMessageHandler {},
-			send_only_message_handler: &IgnoringMessageHandler {},
-		};
-		let rand = OsRng.get_secure_random_bytes();
-		let peer_manager =
-			Arc::new(PeerManager::new(handlers, 0, &rand, &TestLogger, Arc::clone(&signer)));
+		do_test().await;
+	}
 
-		// Maintain a connection to a static LDK node which we know will do DNS resolutions for us.
-		let their_id_hex = "03db10aa09ff04d3568b0621750794063df401e6853c79a21a83e1a3f3b5bfb0c8";
-		let their_id = PublicKey::from_slice(&Vec::<u8>::from_hex(their_id_hex).unwrap()).unwrap();
-		let addr = "ldk-ln-node.bitcoin.ninja:9735".to_socket_addrs().unwrap().next().unwrap();
-		let connect_pm = Arc::clone(&peer_manager);
-		tokio::spawn(async move {
-			loop {
-				lightning_net_tokio::connect_outbound(Arc::clone(&connect_pm), their_id, addr)
-					.await
-					.unwrap()
-					.await;
+	async fn do_test() {
+		// Resolution against the live network can be slow or fail transiently regardless, so
+		// retry a couple of times before giving up. Each attempt syncs a fresh network graph.
+		for _ in 0..5 {
+			if do_test_attempt().await {
+				return;
 			}
-		});
-
-		let pm_reference = Arc::clone(&peer_manager);
-		tokio::spawn(async move {
-			pm_reference.process_events();
-			tokio::time::sleep(Duration::from_micros(10)).await;
-		});
-
-		let their_node_id = NodeId::from_pubkey(&their_id);
-		loop {
-			{
-				let graph = graph.read_only();
-				let have_announcement =
-					graph.nodes().get(&their_node_id).map(|node| node.announcement_info.is_some());
-				if have_announcement.unwrap_or(false) {
-					break;
-				}
-			}
-			tokio::time::sleep(Duration::from_millis(5)).await;
-			peer_manager.process_events();
 		}
+		panic!("Failed to resolve payment instructions over the network");
+	}
 
-		let instructions = PaymentInstructions::parse(
-			"send.some@satsto.me",
-			bitcoin::Network::Bitcoin,
-			&*resolver,
-			true,
-		)
-		.await
-		.unwrap();
+	async fn do_test_attempt() -> bool {
+		// Set once the attempt is done, however it ends, so that the background loops spawned
+		// below stop hammering the resolver node during any retry.
+		let shutdown = Arc::new(AtomicBool::new(false));
+		let attempt = async {
+			let graph = Arc::new(NetworkGraph::new(Network::Bitcoin, &TestLogger));
+			let their_id_hex = "03db10aa09ff04d3568b0621750794063df401e6853c79a21a83e1a3f3b5bfb0c8";
+			let their_id =
+				PublicKey::from_slice(&Vec::<u8>::from_hex(their_id_hex).unwrap()).unwrap();
+			// A transient DNS failure shouldn't panic the test, just fail this attempt.
+			let Ok(mut addrs) = "ldk-ln-node.bitcoin.ninja:9735".to_socket_addrs() else {
+				return false;
+			};
+			let Some(addr) = addrs.next() else { return false };
 
-		let resolved = if let PaymentInstructions::ConfigurableAmount(instr) = instructions {
-			assert_eq!(instr.min_amt(), None);
-			assert_eq!(instr.max_amt(), None);
+			let resolver =
+				Arc::new(LDKOnionMessageDNSSECHrnResolver::new(Arc::clone(&graph), vec![their_id]));
+			let signer = Arc::new(KeysManager::new(&OsRng.get_secure_random_bytes(), 0, 0, true));
+			let message_router = Arc::new(DefaultMessageRouter::new(Arc::clone(&graph), &OsRng));
+			let messenger = Arc::new(OnionMessenger::new(
+				&OsRng,
+				Arc::clone(&signer),
+				&TestLogger,
+				&NoPeers,
+				message_router,
+				&IgnoringMessageHandler {},
+				&IgnoringMessageHandler {},
+				Arc::clone(&resolver),
+				&IgnoringMessageHandler {},
+			));
+			let no_utxos = None::<&(dyn UtxoLookup + Sync + Send)>;
+			let handlers = MessageHandler {
+				chan_handler: Arc::new(ErroringMessageHandler::new()),
+				route_handler: Arc::new(P2PGossipSync::new(
+					Arc::clone(&graph),
+					no_utxos,
+					&TestLogger,
+				)),
+				onion_message_handler: Arc::clone(&messenger),
+				custom_message_handler: &IgnoringMessageHandler {},
+				send_only_message_handler: &IgnoringMessageHandler {},
+			};
+			let rand = OsRng.get_secure_random_bytes();
+			let peer_manager =
+				Arc::new(PeerManager::new(handlers, 0, &rand, &TestLogger, Arc::clone(&signer)));
 
-			assert_eq!(instr.pop_callback(), None);
-			assert!(instr.bip_353_dnssec_proof().is_some());
+			// Maintain a connection to a static LDK node which we know will do DNS resolutions for us.
+			let connect_pm = Arc::clone(&peer_manager);
+			let connect_shutdown = Arc::clone(&shutdown);
+			tokio::spawn(async move {
+				loop {
+					if connect_shutdown.load(Ordering::Relaxed) {
+						return;
+					}
+					match lightning_net_tokio::connect_outbound(
+						Arc::clone(&connect_pm),
+						their_id,
+						addr,
+					)
+					.await
+					{
+						Some(fut) => {
+							fut.await;
+							tokio::time::sleep(Duration::from_millis(100)).await;
+						},
+						// A failed TCP connection shouldn't kill the reconnect loop.
+						None => tokio::time::sleep(Duration::from_secs(1)).await,
+					}
+				}
+			});
 
-			let hrn = instr.human_readable_name().as_ref().unwrap();
+			// Connect to any node the onion messenger needs a connection to in order to send its
+			// queries.
+			let events_messenger = Arc::clone(&messenger);
+			let events_pm = Arc::clone(&peer_manager);
+			let events_shutdown = Arc::clone(&shutdown);
+			tokio::spawn(async move {
+				loop {
+					if events_shutdown.load(Ordering::Relaxed) {
+						return;
+					}
+					events_messenger.process_pending_events(&|event| {
+						if let Event::ConnectionNeeded { node_id, addresses } = event {
+							// Skip nodes whose addresses we can't resolve rather than panicking;
+							// the attempt will fail via its timeouts if none are reachable.
+							let resolved = match addresses.into_iter().next() {
+								Some(addr) => {
+									addr.to_socket_addrs().ok().and_then(|mut addrs| addrs.next())
+								},
+								None => {
+									assert_eq!(node_id, their_id);
+									Some(addr)
+								},
+							};
+							let Some(addr) = resolved else { return Ok(()) };
+							let connect_pm = Arc::clone(&events_pm);
+							tokio::spawn(async move {
+								lightning_net_tokio::connect_outbound(connect_pm, node_id, addr)
+									.await
+									.unwrap()
+									.await;
+							});
+						}
+						Ok(())
+					});
+					tokio::time::sleep(Duration::from_millis(10)).await;
+				}
+			});
+
+			let pm_reference = Arc::clone(&peer_manager);
+			let poller_shutdown = Arc::clone(&shutdown);
+			tokio::spawn(async move {
+				loop {
+					if poller_shutdown.load(Ordering::Relaxed) {
+						return;
+					}
+					pm_reference.process_events();
+					tokio::time::sleep(Duration::from_micros(10)).await;
+				}
+			});
+
+			let parsed = tokio::time::timeout(
+				Duration::from_secs(30),
+				PaymentInstructions::parse(
+					"send.some@satsto.me",
+					bitcoin::Network::Bitcoin,
+					&*resolver,
+					true,
+				),
+			)
+			.await;
+			let instructions = match parsed {
+				Ok(Ok(instructions)) => instructions,
+				_ => return false,
+			};
+
+			let resolved = if let PaymentInstructions::ConfigurableAmount(instr) = instructions {
+				assert_eq!(instr.min_amt(), None);
+				assert_eq!(instr.max_amt(), None);
+
+				assert_eq!(instr.pop_callback(), None);
+				assert!(instr.bip_353_dnssec_proof().is_some());
+
+				let hrn = instr.human_readable_name().as_ref().unwrap();
+				assert_eq!(hrn.user(), "send.some");
+				assert_eq!(hrn.domain(), "satsto.me");
+
+				instr.set_amount(Amount::from_sats(100_000).unwrap(), &*resolver).await.unwrap()
+			} else {
+				panic!();
+			};
+
+			assert_eq!(resolved.pop_callback(), None);
+			assert!(resolved.bip_353_dnssec_proof().is_some());
+
+			let hrn = resolved.human_readable_name().as_ref().unwrap();
 			assert_eq!(hrn.user(), "send.some");
 			assert_eq!(hrn.domain(), "satsto.me");
 
-			instr.set_amount(Amount::from_sats(100_000).unwrap(), &*resolver).await.unwrap()
-		} else {
-			panic!();
-		};
-
-		assert_eq!(resolved.pop_callback(), None);
-		assert!(resolved.bip_353_dnssec_proof().is_some());
-
-		let hrn = resolved.human_readable_name().as_ref().unwrap();
-		assert_eq!(hrn.user(), "send.some");
-		assert_eq!(hrn.domain(), "satsto.me");
-
-		for method in resolved.methods() {
-			match method {
-				PaymentMethod::LightningBolt11(_) => {
-					panic!("Should only have static payment instructions");
-				},
-				PaymentMethod::LightningBolt12(_) => {},
-				PaymentMethod::OnChain { .. } => {},
-				PaymentMethod::Bark(_) => {},
-				PaymentMethod::Cashu(_) => {},
+			for method in resolved.methods() {
+				match method {
+					PaymentMethod::LightningBolt11(_) => {
+						panic!("Should only have static payment instructions");
+					},
+					PaymentMethod::LightningBolt12(_) => {},
+					PaymentMethod::OnChain { .. } => {},
+					PaymentMethod::Bark(_) => {},
+					PaymentMethod::Cashu(_) => {},
+				}
 			}
-		}
+			true
+		};
+		// Bound the whole attempt so that a stuck connection or graph sync can't hang the test
+		// forever.
+		let res = tokio::time::timeout(Duration::from_secs(2 * 60), attempt).await.unwrap_or(false);
+		shutdown.store(true, Ordering::Relaxed);
+		res
 	}
 }
