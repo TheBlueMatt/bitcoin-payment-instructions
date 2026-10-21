@@ -124,8 +124,7 @@ where
 			network_graph,
 			resolver_nodes,
 			next_id: AtomicUsize::new(0),
-			// TODO: Swap for `new_without_expiry_validation` when we upgrade to LDK 0.2
-			resolver: OMNameResolver::new(0, 0),
+			resolver: OMNameResolver::new_without_no_std_expiry_validation(),
 			pending_resolutions: Mutex::new(HashMap::new()),
 			message_queue: Mutex::new(Vec::new()),
 			pm_event_poker: RwLock::new(None),
@@ -191,8 +190,8 @@ where
 		let payment_id = PaymentId(payment_id);
 
 		let err = "The provided HRN did not fit in a DNS request";
-		// TODO: Once LDK 0.2 ships with a new context authentication method, we shouldn't need the
-		// RNG here and can stop depending on std.
+		// TODO: Once LDK ships a response context authentication method which doesn't require
+		// client-side entropy, we shouldn't need the RNG here and can stop depending on std.
 		let (query, dns_context) =
 			self.resolver.resolve_name(payment_id, *hrn, &OsRng).map_err(|_| err)?;
 		let context = MessageContext::DNSResolver(dns_context);
@@ -205,12 +204,11 @@ where
 
 			// If we're running in no-std, we won't expire lookups with the time updates above, so walk
 			// the pending resolution list and expire them here.
-			pending_resolutions.retain(|_name, resolutions| {
-				resolutions.retain(|(_payment_id, resolution)| {
+			pending_resolutions.retain(|name, resolutions| {
+				resolutions.retain(|(payment_id, resolution)| {
 					let has_receiver = resolution.receiver_alive();
 					if !has_receiver {
-						// TODO: Once LDK 0.2 ships, expire the pending resolution in the resolver:
-						// self.resolver.expire_pending_resolution(name, payment_id);
+						self.resolver.expire_pending_resolution(name, *payment_id);
 					}
 					has_receiver
 				});
