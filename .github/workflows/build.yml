@@ -18,10 +18,10 @@ jobs:
       fail-fast: false
       matrix:
         platform: [ ubuntu-latest, windows-latest, macos-latest ]
-        toolchain: [ stable, beta, 1.63.0 ] # 1.63.0 is the MSRV
+        toolchain: [ stable, beta, 1.85.0 ] # 1.85.0 is the MSRV
         exclude:
           - platform: windows-latest
-            toolchain: 1.63.0
+            toolchain: 1.85.0
     runs-on: ${{ matrix.platform }}
     steps:
       - name: Checkout source code
@@ -32,7 +32,7 @@ jobs:
         if: "matrix.platform == 'ubuntu-latest'"
         run: shellcheck ci/*.sh -aP ci
       - name: Set RUSTFLAGS to deny warnings
-        if: "matrix.toolchain == '1.63.0'"
+        if: "matrix.toolchain == '1.85.0'"
         run: echo "RUSTFLAGS=-D warnings" >> "$GITHUB_ENV"
       - name: Run CI script
         shell: bash # Default on Winblows is powershell
@@ -41,7 +41,7 @@ jobs:
   linting:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.63.0
+      TOOLCHAIN: 1.85.0
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -57,7 +57,7 @@ jobs:
   rustfmt:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.63.0
+      TOOLCHAIN: 1.85.0
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4
@@ -72,7 +72,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     env:
-      TOOLCHAIN: 1.63
+      TOOLCHAIN: 1.85
     steps:
       - name: Checkout source code
         uses: actions/checkout@v4

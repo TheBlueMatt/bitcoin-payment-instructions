@@ -199,7 +199,7 @@ where
 		let (send, recv) = channel();
 		{
 			let mut pending_resolutions = self.pending_resolutions.lock().unwrap();
-			let senders = pending_resolutions.entry(*hrn).or_insert_with(Vec::new);
+			let senders = pending_resolutions.entry(*hrn).or_default();
 			senders.push((payment_id, send));
 
 			// If we're running in no-std, we won't expire lookups with the time updates above, so walk
