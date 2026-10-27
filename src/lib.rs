@@ -615,6 +615,47 @@ fn split_once(haystack: &str, needle: char) -> (&str, Option<&str>) {
 	haystack.split_once(needle).map(|(a, b)| (a, Some(b))).unwrap_or((haystack, None))
 }
 
+/// LUD-01 only allows LNURL endpoints which are fetched over `https` or over `http` if the host is
+/// a Tor onion service, as anything else would allow a network attacker to trivially rewrite the
+/// payment instructions we end up with.
+///
+/// We additionally allow `http` to loopback hosts, which cannot be intercepted by a network
+/// attacker and are useful when testing against a local server.
+fn check_lnurl_url(url: &str) -> Result<(), ParseError> {
+	let err = "LNURL must be fetched over https, or over http for onion or loopback hosts";
+	let (scheme, rest) = split_once(url, ':');
+	let authority = match rest.and_then(|rest| rest.strip_prefix("//")) {
+		Some(authority) => authority,
+		None => return Err(ParseError::InvalidLnurl(err)),
+	};
+	if scheme.eq_ignore_ascii_case("https") {
+		return Ok(());
+	}
+	if !scheme.eq_ignore_ascii_case("http") {
+		return Err(ParseError::InvalidLnurl(err));
+	}
+
+	let authority_end = authority.find(|c| c == '/' || c == '?' || c == '#');
+	let authority = &authority[..authority_end.unwrap_or(authority.len())];
+	let host_port = match authority.rfind('@') {
+		Some(idx) => &authority[idx + 1..],
+		None => authority,
+	};
+	// An IPv6 host is wrapped in brackets, which we have to walk past before looking for the port
+	let host = match host_port.find(']') {
+		Some(idx) => &host_port[..idx + 1],
+		None => split_once(host_port, ':').0,
+	};
+
+	let onion = host.len() > ".onion".len() && host.to_ascii_lowercase().ends_with(".onion");
+	let loopback = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "[::1]";
+	if onion || loopback {
+		Ok(())
+	} else {
+		Err(ParseError::InvalidLnurl(err))
+	}
+}
+
 fn un_percent_encode(encoded: &str) -> Result<String, ParseError> {
 	let mut res = Vec::with_capacity(encoded.len());
 	let mut iter = encoded.bytes();
@@ -1131,6 +1172,7 @@ impl PaymentInstructions {
 					recipient_description,
 					callback,
 				} => {
+					check_lnurl_url(&callback)?;
 					let inner = PaymentInstructionsImpl {
 						description: recipient_description,
 						methods: Vec::new(),
@@ -1165,6 +1207,7 @@ impl PaymentInstructions {
 			if let Ok((_, data)) = bitcoin::bech32::decode(lnurl_str) {
 				let url = String::from_utf8(data)
 					.map_err(|_| ParseError::InvalidLnurl("Not utf-8 encoded string"))?;
+				check_lnurl_url(&url)?;
 				let resolution = hrn_resolver.resolve_lnurl(&url).await;
 				let resolution = resolution.map_err(ParseError::HrnResolutionError)?;
 				match resolution {
@@ -1178,6 +1221,7 @@ impl PaymentInstructions {
 						recipient_description,
 						callback,
 					} => {
+						check_lnurl_url(&callback)?;
 						let inner = PaymentInstructionsImpl {
 							description: recipient_description,
 							methods: Vec::new(),
@@ -1219,11 +1263,18 @@ mod tests {
 	use super::*;
 
 	use crate::hrn_resolution::DummyHrnResolver;
+	#[cfg(feature = "std")]
+	use crate::hrn_resolution::{HrnResolutionFuture, LNURLResolutionFuture};
 
 	const SAMPLE_INVOICE_WITH_FALLBACK: &str = "lnbc20m1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqhp58yjmdan79s6qqdhdzgynm4zwqd5d7xmw5fk98klysy043l2ahrqsfpp3qjmp7lwpagxun9pygexvgpjdc4jdj85fr9yq20q82gphp2nflc7jtzrcazrra7wwgzxqc8u7754cdlpfrmccae92qgzqvzq2ps8pqqqqqqpqqqqq9qqqvpeuqafqxu92d8lr6fvg0r5gv0heeeqgcrqlnm6jhphu9y00rrhy4grqszsvpcgpy9qqqqqqgqqqqq7qqzq9qrsgqdfjcdk6w3ak5pca9hwfwfh63zrrz06wwfya0ydlzpgzxkn5xagsqz7x9j4jwe7yj7vaf2k9lqsdk45kts2fd0fkr28am0u4w95tt2nsq76cqw0";
 	const SAMPLE_INVOICE: &str = "lnbc20m1pn7qa2ndqqnp4q0d3p2sfluzdx45tqcsh2pu5qc7lgq0xs578ngs6s0s68ua4h7cvspp5kwzshmne5zw3lnfqdk8cv26mg9ndjapqzhcxn2wtn9d6ew5e2jfqsp5h3u5f0l522vs488h6n8zm5ca2lkpva532fnl2kp4wnvsuq445erq9qyysgqcqpcxqppz4395v2sjh3t5pzckgeelk9qf0z3fm9jzxtjqpqygayt4xyy7tpjvq5pe7f6727du2mg3t2tfe0cd53de2027ff7es7smtew8xx5x2spwuvkdz";
 	const SAMPLE_OFFER: &str = "lno1qgs0v8hw8d368q9yw7sx8tejk2aujlyll8cp7tzzyh5h8xyppqqqqqqgqvqcdgq2qenxzatrv46pvggrv64u366d5c0rr2xjc3fq6vw2hh6ce3f9p7z4v4ee0u7avfynjw9q";
 	const SAMPLE_BIP21: &str = "bitcoin:1andreas3batLhQa2FawWjeyjCqyBzypd?amount=50&label=Luke-Jr&message=Donation%20for%20project%20xyz";
+
+	// lnurl encoding of http://example.com/.well-known/lnurlp/test
+	#[cfg(feature = "std")]
+	const SAMPLE_LNURL_PLAINTEXT_HTTP: &str =
+		"LNURL1DP68GUP69UHK27RPD4CXCEFWVDHK6TEWWAJKCMPDDDHX7AMW9AKXUATJD3CZ7AR9WD6QXQHN6Q";
 
 	#[cfg(feature = "http")]
 	const SAMPLE_LNURL: &str = "LNURL1DP68GURN8GHJ7MRWW4EXCTNDW46XJMNEDEJHGTNRDAKJ7TNHV4KXCTTTDEHHWM30D3H82UNVWQHHYETXW4HXG0AH8NK";
@@ -1770,6 +1821,76 @@ mod tests {
 		assert_eq!(parsed.methods().count(), 1);
 		assert_eq!(parsed.min_amt(), Some(Amount::from_milli_sats(1000).unwrap()));
 		assert_eq!(parsed.max_amt(), Some(Amount::from_milli_sats(11000000000).unwrap()));
+	}
+
+	#[test]
+	fn check_lnurl_urls() {
+		assert!(check_lnurl_url("https://example.com/pay").is_ok());
+		assert!(check_lnurl_url("HTTPS://example.com/pay").is_ok());
+		assert!(check_lnurl_url("http://example.com/pay").is_err());
+		assert!(check_lnurl_url("ftp://example.com/pay").is_err());
+		assert!(check_lnurl_url("example.com/pay").is_err());
+
+		assert!(check_lnurl_url("http://expyuzz4wqqyqhjn.onion/pay").is_ok());
+		assert!(check_lnurl_url("http://EXPYUZZ4WQQYQHJN.ONION:8080/pay").is_ok());
+		assert!(check_lnurl_url("http://.onion/pay").is_err());
+		assert!(check_lnurl_url("http://example.com/expyuzz4wqqyqhjn.onion").is_err());
+		assert!(check_lnurl_url("http://expyuzz4wqqyqhjn.onion@example.com/pay").is_err());
+
+		assert!(check_lnurl_url("http://localhost:8080/pay").is_ok());
+		assert!(check_lnurl_url("http://127.0.0.1/pay").is_ok());
+		assert!(check_lnurl_url("http://[::1]:8080/pay").is_ok());
+		assert!(check_lnurl_url("http://localhost.example.com/pay").is_err());
+	}
+
+	#[cfg(feature = "std")]
+	#[tokio::test]
+	async fn parse_plaintext_http_lnurl() {
+		let res = PaymentInstructions::parse(
+			SAMPLE_LNURL_PLAINTEXT_HTTP,
+			Network::Bitcoin,
+			&DummyHrnResolver,
+			false,
+		)
+		.await;
+		assert!(matches!(res, Err(ParseError::InvalidLnurl(_))), "{:?}", res);
+	}
+
+	#[cfg(feature = "std")]
+	struct PlaintextCallbackHrnResolver;
+
+	#[cfg(feature = "std")]
+	impl HrnResolver for PlaintextCallbackHrnResolver {
+		fn resolve_hrn<'a>(&'a self, _hrn: &'a HumanReadableName) -> HrnResolutionFuture<'a> {
+			Box::pin(async {
+				Ok(HrnResolution::LNURLPay {
+					min_value: Amount::from_sats(1).unwrap(),
+					max_value: Amount::from_sats(100).unwrap(),
+					expected_description_hash: [0; 32],
+					recipient_description: None,
+					callback: "http://example.com/lnurl/callback".to_string(),
+				})
+			})
+		}
+
+		fn resolve_lnurl<'a>(&'a self, _lnurl: &'a str) -> HrnResolutionFuture<'a> {
+			unreachable!();
+		}
+
+		fn resolve_lnurl_to_invoice<'a>(
+			&'a self, _: String, _: Amount, _: [u8; 32],
+		) -> LNURLResolutionFuture<'a> {
+			unreachable!();
+		}
+	}
+
+	#[cfg(feature = "std")]
+	#[tokio::test]
+	async fn parse_hrn_with_plaintext_http_callback() {
+		let resolver = PlaintextCallbackHrnResolver;
+		let hrn = "test@example.com";
+		let res = PaymentInstructions::parse(hrn, Network::Bitcoin, &resolver, false).await;
+		assert!(matches!(res, Err(ParseError::InvalidLnurl(_))), "{:?}", res);
 	}
 
 	#[cfg(feature = "http")]
