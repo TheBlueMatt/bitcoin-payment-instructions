@@ -61,9 +61,13 @@ impl HTTPHrnResolver {
 	/// Each endpoint is a DoH URL, ending in `dns=`, such as `https://dns.google/dns-query?dns=`.
 	/// The path can be anything the server uses. The encoded DNS query is appended to it.
 	///
-	/// If `doh_endpoints` is empty, BIP 353 resolution is skipped and LNURL resolution is tried.
+	/// If `doh_endpoints` is empty, the defaults in [`DEFAULT_DOH_ENDPOINTS`] are used instead.
 	pub fn with_endpoints(mut self, doh_endpoints: Vec<String>) -> Self {
-		self.doh_endpoints = doh_endpoints;
+		if doh_endpoints.is_empty() {
+			self.doh_endpoints = DEFAULT_DOH_ENDPOINTS.iter().map(|s| s.to_string()).collect();
+		} else {
+			self.doh_endpoints = doh_endpoints;
+		}
 		self
 	}
 }
@@ -327,14 +331,11 @@ mod tests {
 		assert_eq!(&to_base64(b"Man"), "TWFu");
 	}
 
-	#[tokio::test]
-	async fn test_empty_endpoints_skips_doh() {
+	#[test]
+	fn test_empty_endpoints_fall_back_to_defaults() {
 		let resolver = HTTPHrnResolver::new().with_endpoints(Vec::new());
-		let hrn = HumanReadableName::new("send.some", "satsto.me").unwrap();
-		match resolver.resolve_dns(&hrn).await {
-			Err(err) => assert_eq!(err, DNS_ERR),
-			Ok(_) => panic!("Expected DoH to be skipped"),
-		}
+		let expected = DEFAULT_DOH_ENDPOINTS.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+		assert_eq!(resolver.doh_endpoints, expected);
 	}
 
 	#[tokio::test]
