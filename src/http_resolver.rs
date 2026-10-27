@@ -1,5 +1,5 @@
-//! A [`HrnResolver`] which uses `bitreq` and `dns.google` (8.8.8.8) to resolve Human Readable
-//! Names into bitcoin payment instructions.
+//! A [`HrnResolver`] which uses `bitreq` and DNS-over-HTTPS to
+//! resolve Human Readable Names into bitcoin payment instructions.
 
 use std::boxed::Box;
 use std::fmt::Write;
@@ -21,15 +21,21 @@ use crate::hrn_resolution::{
 	HrnResolution, HrnResolutionFuture, HrnResolver, HumanReadableName, LNURLResolutionFuture,
 };
 
-const DOH_ENDPOINT: &'static str = "https://dns.google/dns-query?dns=";
+/// The default DNS-over-HTTPS endpoints used by [`HTTPHrnResolver::new`].
+pub const DEFAULT_DOH_ENDPOINTS: &[&str] =
+	&["https://dns.google/dns-query?dns=", "https://cloudflare-dns.com/dns-query?dns="];
 
-/// An [`HrnResolver`] which uses `bitreq` and `dns.google` (8.8.8.8) to resolve Human Readable
-/// Names into bitcoin payment instructions.
+/// An [`HrnResolver`] which uses `bitreq` and DNS-over-HTTPS to resolve Human Readable Names
+/// into bitcoin payment instructions.
 ///
-/// Note that using this may reveal our IP address to the recipient and information about who we're
-/// paying to Google (via `dns.google`).
+/// By default it tries the providers in [`DEFAULT_DOH_ENDPOINTS`] one by one until one works.
+/// Use [`HTTPHrnResolver::with_endpoints`] to use different DoH endpoints.
+///
+/// Note that using this may reveal our IP address to the recipient and information about who
+/// we're paying to the DoH provider which serves the request.
 #[derive(Debug, Clone)]
 pub struct HTTPHrnResolver {
+	doh_endpoints: Vec<String>,
 	#[cfg(feature = "http_proxied")]
 	proxy: Option<bitreq::Proxy>,
 }
@@ -38,6 +44,7 @@ impl HTTPHrnResolver {
 	/// Create a new `HTTPHrnResolver`
 	pub fn new() -> Self {
 		HTTPHrnResolver {
+			doh_endpoints: DEFAULT_DOH_ENDPOINTS.iter().map(|s| s.to_string()).collect(),
 			#[cfg(feature = "http_proxied")]
 			proxy: None,
 		}
@@ -46,7 +53,18 @@ impl HTTPHrnResolver {
 	/// Create a new `HTTPHrnResolver` which makes all requests via the given proxy.
 	#[cfg(feature = "http_proxied")]
 	pub fn new_proxied(proxy: bitreq::Proxy) -> Self {
-		HTTPHrnResolver { proxy: Some(proxy) }
+		HTTPHrnResolver { proxy: Some(proxy), ..Self::new() }
+	}
+
+	/// Overrides the DoH endpoints to query, in order.
+	///
+	/// Each endpoint is a DoH URL, ending in `dns=`, such as `https://dns.google/dns-query?dns=`.
+	/// The path can be anything the server uses. The encoded DNS query is appended to it.
+	///
+	/// If `doh_endpoints` is empty, BIP 353 resolution is skipped and LNURL resolution is tried.
+	pub fn with_endpoints(mut self, doh_endpoints: Vec<String>) -> Self {
+		self.doh_endpoints = doh_endpoints;
+		self
 	}
 }
 
@@ -90,14 +108,14 @@ fn write_base64(mut bytes: &[u8], out: &mut String) {
 	}
 }
 
-fn query_to_url(query: QueryBuf) -> String {
+fn query_to_url(doh_endpoint: &str, query: &QueryBuf) -> String {
 	let base64_len = (query.len() * 8 + 5) / 6;
-	let mut query_string = String::with_capacity(base64_len + DOH_ENDPOINT.len());
+	let mut query_string = String::with_capacity(base64_len + doh_endpoint.len());
 
-	query_string += DOH_ENDPOINT;
+	query_string += doh_endpoint;
 	write_base64(&query[..], &mut query_string);
 
-	debug_assert_eq!(query_string.len(), base64_len + DOH_ENDPOINT.len());
+	debug_assert_eq!(query_string.len(), base64_len + doh_endpoint.len());
 
 	query_string
 }
@@ -122,7 +140,7 @@ struct LNURLCallbackResponse {
 	routes: Vec<String>,
 }
 
-const DNS_ERR: &'static str = "DNS Request to dns.google failed";
+const DNS_ERR: &'static str = "DNS Request failed against DoH endpoints";
 
 /// DNS responses should, at max, contain a few public keys or a TXT record or two and some
 /// signatures. Each record can only be up to 16 KiB, though we don't expect to ever see a record
@@ -144,6 +162,17 @@ impl HTTPHrnResolver {
 		Ok(resp.into_bytes())
 	}
 
+	/// Sends a single DNS query, trying each configured endpoint until one works.
+	async fn query_doh(&self, query: &QueryBuf) -> Result<Vec<u8>, &'static str> {
+		for doh_endpoint in &self.doh_endpoints {
+			let request_url = query_to_url(doh_endpoint, query);
+			if let Ok(body) = self.http_get(&request_url, true).await {
+				return Ok(body);
+			}
+		}
+		Err(DNS_ERR)
+	}
+
 	async fn resolve_dns(&self, hrn: &HumanReadableName) -> Result<HrnResolution, &'static str> {
 		let dns_name =
 			Name::try_from(format!("{}.user._bitcoin-payment.{}.", hrn.user(), hrn.domain()))
@@ -152,8 +181,7 @@ impl HTTPHrnResolver {
 		let mut pending_queries = vec![initial_query];
 
 		while let Some(query) = pending_queries.pop() {
-			let request_url = query_to_url(query);
-			let body = self.http_get(&request_url, true).await.map_err(|_| DNS_ERR)?;
+			let body = self.query_doh(&query).await?;
 
 			let mut answer = QueryBuf::new_zeroed(0);
 			answer.extend_from_slice(&body[..]);
@@ -297,6 +325,43 @@ mod tests {
 			"TWFueSBoYW5kcyBtYWtlIGxpZ2h0IHdvcmsu"
 		);
 		assert_eq!(&to_base64(b"Man"), "TWFu");
+	}
+
+	#[tokio::test]
+	async fn test_empty_endpoints_skips_doh() {
+		let resolver = HTTPHrnResolver::new().with_endpoints(Vec::new());
+		let hrn = HumanReadableName::new("send.some", "satsto.me").unwrap();
+		match resolver.resolve_dns(&hrn).await {
+			Err(err) => assert_eq!(err, DNS_ERR),
+			Ok(_) => panic!("Expected DoH to be skipped"),
+		}
+	}
+
+	#[tokio::test]
+	async fn test_doh_fallback_on_unreachable_primary() {
+		// Put an endpoint which can't possibly respond first, followed by the real Google and
+		// Cloudflare endpoints, to confirm we fall back rather than failing outright.
+		let resolver = HTTPHrnResolver::new().with_endpoints(vec![
+			"https://dns.google.invalid/dns-query?dns=".to_string(),
+			"https://dns.google/dns-query?dns=".to_string(),
+			"https://cloudflare-dns.com/dns-query?dns=".to_string(),
+		]);
+		let instructions = PaymentInstructions::parse(
+			"send.some@satsto.me",
+			bitcoin::Network::Bitcoin,
+			&resolver,
+			true,
+		)
+		.await
+		.unwrap();
+
+		if let PaymentInstructions::ConfigurableAmount(instr) = instructions {
+			let hrn = instr.human_readable_name().as_ref().unwrap();
+			assert_eq!(hrn.user(), "send.some");
+			assert_eq!(hrn.domain(), "satsto.me");
+		} else {
+			panic!();
+		}
 	}
 
 	#[tokio::test]
